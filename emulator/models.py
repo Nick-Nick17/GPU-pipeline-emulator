@@ -120,3 +120,41 @@ class Decision:
     """
     close_batch_at: Optional[float]   # None = don't close yet, wait for next event
     batch_size: Optional[int]         # how many to take from queue front (None = all)
+
+
+@dataclass
+class BatchObservation:
+    """
+    Black-box record of one finished batch (task 2).
+    The only thing we are allowed to know: when the batch entered the
+    pipeline (was sealed) and when it came back. No prepare/infer split.
+    """
+    batch_id: int
+    size: int
+    close_time: float    # batch entered the pipeline (prepare started)
+    return_time: float   # batch exited (all responses returned)
+
+    @property
+    def total_latency(self) -> float:
+        return self.return_time - self.close_time
+
+
+@dataclass
+class AdvancedState:
+    """
+    Restricted snapshot for task 2 policies.
+
+    Unlike SystemState, this DOES NOT expose internal pipeline structure
+    (no params split, no infer_busy / infer_end_time, no committed work).
+    Decisions may only rely on:
+      - the current waiting queue (arrival times are observable)
+      - the SLA budget
+      - how many batches are currently in flight (entered but not returned)
+      - the history of finished batches as (size -> total round-trip time)
+    Policy must NOT mutate this — read only.
+    """
+    now: float
+    queue: List[Request]              # requests waiting to be batched
+    sla_ms: float
+    in_flight: int                    # batches sealed but not yet returned
+    observations: List[BatchObservation]  # finished batches (black-box timings)

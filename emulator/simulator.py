@@ -17,7 +17,7 @@ from collections import deque
 from typing import List, Optional, Deque
 from models import (
     PipelineParams, Request, Batch, Event, EventType,
-    SystemState, Decision
+    SystemState, AdvancedState, BatchObservation, Decision
 )
 from environment import PipelineEnvironment
 from policies import BasePolicy
@@ -35,6 +35,7 @@ class Simulator:
         seed: Optional[int] = 42,
         arrival_jitter: float = 0.25,
         worst_case: bool = False,
+        mode: str = "simple",
     ):
         self.params = params
         self.policy = policy
@@ -42,6 +43,7 @@ class Simulator:
         self.sla_ms = sla_ms
         self.sim_duration_ms = sim_duration_ms
         self.arrival_jitter = arrival_jitter
+        self.mode = mode
 
         self.env = PipelineEnvironment(params, seed=seed, worst_case=worst_case)
         self.rng = random.Random(seed)
@@ -59,6 +61,10 @@ class Simulator:
         self._ready_batches: Deque[Batch] = deque()
         self._committed_count: int = 0
         self._committed_infer_nominal: float = 0.0
+
+        # Black-box state for task 2 (advanced mode)
+        self._in_flight: int = 0
+        self._observations: Deque[BatchObservation] = deque(maxlen=500)
 
         # Results
         self.all_requests: List[Request] = []
@@ -166,6 +172,7 @@ class Simulator:
 
         self._committed_count += 1
         self._committed_infer_nominal += self.params.t_infer_nominal(batch.size)
+        self._in_flight += 1
 
         actual_prepare = self.env.actual_prepare_time(batch.size)
         prepare_end = self._now + actual_prepare
@@ -186,6 +193,14 @@ class Simulator:
 
         for req in batch.requests:
             self.completed_requests.append(req)
+
+        self._in_flight -= 1
+        self._observations.append(BatchObservation(
+            batch_id=batch.batch_id,
+            size=batch.size,
+            close_time=batch.close_time,
+            return_time=self._now,
+        ))
 
         self._dispatch_infer()
         self._consult_policy()
@@ -216,17 +231,26 @@ class Simulator:
     # ------------------------------------------------------------------
 
     def _consult_policy(self):
-        state = SystemState(
-            now=self._now,
-            queue=self._queue,
-            infer_busy=self._infer_busy,
-            infer_end_time=self._infer_end_time,
-            committed_count=self._committed_count,
-            committed_infer_nominal=self._committed_infer_nominal,
-            params=self.params,
-            sla_ms=self.sla_ms,
-            batch_history=list(self.batch_sizes[-20:]),
-        )
+        if self.mode == "advanced":
+            state = AdvancedState(
+                now=self._now,
+                queue=self._queue,
+                sla_ms=self.sla_ms,
+                in_flight=self._in_flight,
+                observations=self._observations,
+            )
+        else:
+            state = SystemState(
+                now=self._now,
+                queue=self._queue,
+                infer_busy=self._infer_busy,
+                infer_end_time=self._infer_end_time,
+                committed_count=self._committed_count,
+                committed_infer_nominal=self._committed_infer_nominal,
+                params=self.params,
+                sla_ms=self.sla_ms,
+                batch_history=list(self.batch_sizes[-20:]),
+            )
 
         decision = self.policy.decide(state)
 

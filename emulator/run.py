@@ -1,5 +1,6 @@
 import sys
 import os
+import argparse
 sys.path.insert(0, os.path.dirname(__file__))
 
 from models import PipelineParams
@@ -15,6 +16,11 @@ from simple_policies import (
     HybridSLAOverlapPolicy,
     PredictiveOverlapPolicy,
     QueueFeedbackPolicy,
+)
+from advanced_policies import (
+    BlackBoxSLAOverlapPolicy,
+    LatencyFeedbackPolicy,
+    ThroughputMatchPolicy,
 )
 from metrics import compute_metrics
 
@@ -44,7 +50,7 @@ SCENARIOS = [
 ]
 
 
-def build_policies(b_max):
+def build_simple_policies(b_max):
     return [
         HybridSLAOverlapPolicy(safety=1.0, collect_ms=0.0, max_batch_size=b_max),
         HybridSLAOverlapPolicy(safety=1.0, collect_ms=150.0, max_batch_size=b_max),
@@ -59,16 +65,28 @@ def build_policies(b_max):
     ]
 
 
-def run_scenario(name, rps, worst_case):
+def build_advanced_policies(b_max):
+    return [
+        BlackBoxSLAOverlapPolicy(safety=1.2, max_in_flight=2, collect_ms=0.0),
+        BlackBoxSLAOverlapPolicy(safety=1.2, max_in_flight=2, collect_ms=150.0),
+        BlackBoxSLAOverlapPolicy(safety=1.2, max_in_flight=1, collect_ms=0.0),
+        LatencyFeedbackPolicy(max_in_flight=2, low=0.55, high=0.85),
+        ThroughputMatchPolicy(alpha=0.2, margin=1.15, safety=1.2, max_in_flight=2),
+    ]
+
+
+def run_scenario(name, rps, worst_case, mode):
     sim_ms = SIM_DURATION_S * 1000
     sla_ms = SLA_MS
     b_max = PARAMS.b_max_safe(sla_ms)
     mult = f"x{1 + PARAMS.variance:.1f} fixed" if worst_case else "U(0.8,1.2)"
     rps_label = "burst" if callable(rps) else f"{rps}"
 
+    build = build_advanced_policies if mode == "advanced" else build_simple_policies
+
     print(f"\n\n{'=' * 86}")
     print(f"  SCENARIO {name}   RPS={rps_label}  SLA={sla_ms:.0f}ms  "
-          f"time={mult}  b_max={b_max}")
+          f"time={mult}  b_max={b_max}  mode={mode}")
     print(f"{'=' * 86}")
     print(f"  {'Policy':<38} {'Success':>8} {'Rate':>7} {'Late':>6} {'batch':>6} "
           f"{'p50':>6} {'p90':>6} {'p99':>6} {'idle':>6}")
@@ -76,7 +94,7 @@ def run_scenario(name, rps, worst_case):
           f"{'-' * 6} {'-' * 6} {'-' * 6} {'-' * 6}")
 
     results = []
-    for policy in build_policies(b_max):
+    for policy in build(b_max):
         sim = Simulator(
             params=PARAMS,
             policy=policy,
@@ -85,6 +103,7 @@ def run_scenario(name, rps, worst_case):
             sim_duration_ms=sim_ms,
             seed=SEED,
             worst_case=worst_case,
+            mode=mode,
         )
         sim.run()
         m = compute_metrics(
@@ -111,10 +130,22 @@ def run_scenario(name, rps, worst_case):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="GPU pipeline batching emulator")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--simple", action="store_const", dest="mode", const="simple",
+                       help="task 1: policies know prepare/infer split (default)")
+    group.add_argument("--advanced", action="store_const", dest="mode", const="advanced",
+                       help="task 2: black-box, only batch entry/exit timing is known")
+    parser.set_defaults(mode="simple")
+    args = parser.parse_args()
+
+    label = "TASK 2 (black box: only batch in/out times)" if args.mode == "advanced" \
+        else "TASK 1 (known prepare/infer split)"
+    print(f"Mode: {args.mode}  ->  {label}")
     print(f"Pipeline: prepare = {PARAMS.a1}*b + {PARAMS.c1}   "
           f"infer = {PARAMS.a2}*b + {PARAMS.c2}   variance=±{PARAMS.variance:.0%}")
     for name, rps, worst_case in SCENARIOS:
-        run_scenario(name, rps, worst_case)
+        run_scenario(name, rps, worst_case, args.mode)
     print()
 
 
