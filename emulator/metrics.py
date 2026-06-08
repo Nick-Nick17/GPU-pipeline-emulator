@@ -1,0 +1,100 @@
+"""
+Metrics: compute and display results from completed requests.
+"""
+import statistics
+from dataclasses import dataclass
+from typing import List, Optional
+from models import Request
+
+
+@dataclass
+class SimMetrics:
+    policy_name: str
+    generated: int
+    counted: int
+    completed: int
+    excluded: int
+    late_unserved: int
+    success_count: int
+    success_rate: float
+    p50_ms: float
+    p90_ms: float
+    p99_ms: float
+    mean_ms: float
+    avg_batch_size: float
+    avg_idle_ms: float
+    sla_ms: float
+
+    def __str__(self) -> str:
+        return (
+            f"\n{'─' * 55}\n"
+            f"  Policy : {self.policy_name}\n"
+            f"  SLA    : {self.sla_ms:.0f} ms\n"
+            f"{'─' * 55}\n"
+            f"  Requests  generated={self.generated}  counted={self.counted}  "
+            f"completed={self.completed}  excluded(tail)={self.excluded}\n"
+            f"  Success   {self.success_count} ({self.success_rate:.1%} of counted)  "
+            f"late_unserved={self.late_unserved}\n"
+            f"  Latency   p50={self.p50_ms:.0f}  p90={self.p90_ms:.0f}  "
+            f"p99={self.p99_ms:.0f}  mean={self.mean_ms:.0f}  ms\n"
+            f"  Avg batch size : {self.avg_batch_size:.1f}\n"
+            f"  Avg idle (prepare→infer wait) : {self.avg_idle_ms:.1f} ms\n"
+            f"{'─' * 55}"
+        )
+
+
+def percentile(data: List[float], p: float) -> float:
+    if not data:
+        return 0.0
+    sorted_data = sorted(data)
+    idx = int(len(sorted_data) * p / 100)
+    idx = min(idx, len(sorted_data) - 1)
+    return sorted_data[idx]
+
+
+def compute_metrics(
+    policy_name: str,
+    all_requests: List[Request],
+    sla_ms: float,
+    batch_sizes: List[int],
+    sim_end_ms: float,
+) -> SimMetrics:
+    latencies = []
+    idles = []
+    success = 0
+    completed = 0
+    late_unserved = 0
+    excluded = 0
+
+    for r in all_requests:
+        if r.latency is not None:
+            completed += 1
+            latencies.append(r.latency)
+            if r.pipeline_idle is not None:
+                idles.append(r.pipeline_idle)
+            if r.latency <= sla_ms:
+                success += 1
+        elif r.arrival_time + sla_ms <= sim_end_ms:
+            late_unserved += 1
+        else:
+            excluded += 1
+
+    counted = completed + late_unserved
+
+    return SimMetrics(
+        policy_name=policy_name,
+        generated=len(all_requests),
+        counted=counted,
+        completed=completed,
+        excluded=excluded,
+        late_unserved=late_unserved,
+        success_count=success,
+        success_rate=success / counted if counted else 0.0,
+        p50_ms=percentile(latencies, 50),
+        p90_ms=percentile(latencies, 90),
+        p99_ms=percentile(latencies, 99),
+        mean_ms=statistics.mean(latencies) if latencies else 0.0,
+        avg_batch_size=statistics.mean(batch_sizes) if batch_sizes else 0.0,
+        avg_idle_ms=statistics.mean(idles) if idles else 0.0,
+        sla_ms=sla_ms,
+    )
