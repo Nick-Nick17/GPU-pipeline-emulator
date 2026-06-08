@@ -20,7 +20,7 @@ from models import (
     SystemState, AdvancedState, BatchObservation, Decision
 )
 from environment import PipelineEnvironment
-from policies import BasePolicy
+from simple_policies import BasePolicy
 
 
 class Simulator:

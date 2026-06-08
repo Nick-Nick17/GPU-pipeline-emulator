@@ -5,17 +5,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from models import PipelineParams
 from simulator import Simulator
-from policies import (
+from simple_policies import (
     TimeoutBatchPolicy,
     FixedSizePolicy,
     SLABudgetPolicy,
-)
-from optimal_policy import OptimalOverlapPolicy
-
-from simple_policies import (
     HybridSLAOverlapPolicy,
     PredictiveOverlapPolicy,
     QueueFeedbackPolicy,
+    OptimalOverlapPolicy,
 )
 from advanced_policies import (
     BlackBoxSLAOverlapPolicy,

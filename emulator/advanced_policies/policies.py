@@ -1,116 +1,23 @@
 """
 Task 2 policies — the "black box" pipeline.
 
-Here we are NOT allowed to know the prepare/infer split, whether the infer
-slot is busy, or any nominal timing. The only signal is:
+The prepare/infer split, infer_busy and nominal timings are NOT visible. The only
+signal: for every batch we sent, when it entered and when it came back. So a batch
+of size b is a black box returning after T_total(b); policies learn that online.
 
-    for every batch we sent, when it entered and when it came back.
-
-So a batch of size b is a black box that returns after some total time
-T_total(b). Policies below LEARN that function online from observations and
-make all decisions from it + the SLA + the visible queue.
-
-Overlap trick without knowing the split:
-    In the real system prepare can overlap with the previous infer. A black-box
-    policy reproduces that by keeping a small number of batches "in flight"
-    (max_in_flight). With max_in_flight=1 the slot idles during every prepare;
-    with max_in_flight=2 there is always one batch preparing while another is
-    being processed, so the pipeline stays busy — same effect as overlap, but
-    discovered purely from entry/exit timing.
+Overlap without knowing the split: keep up to max_in_flight batches in flight.
+  max_in_flight=1 → the slot idles during every prepare.
+  max_in_flight=2 → one batch prepares while another runs → pipeline stays busy.
 """
 
-from abc import ABC, abstractmethod
-from collections import deque
-from typing import Optional, List, Tuple, Deque
+from typing import Optional
 
-from models import AdvancedState, BatchObservation, Decision
-
-
-class BaseAdvancedPolicy(ABC):
-    @abstractmethod
-    def decide(self, state: AdvancedState) -> Decision:
-        ...
-
-    def name(self) -> str:
-        return self.__class__.__name__
-
-
-class TotalTimeModel:
-    """
-    Online linear fit of the black-box round-trip time: T_total(b) ~= A*b + C.
-
-    Keeps a sliding window of recent (size, total_latency) observations and the
-    running sums needed for least squares, so each update is O(1).
-    """
-
-    def __init__(self, window: int = 200):
-        self.window = window
-        self._obs: Deque[Tuple[float, float]] = deque()
-        self._last_id: int = -1
-        self._sb = self._st = self._sbb = self._sbt = 0.0
-
-    def _add(self, b: float, t: float) -> None:
-        self._obs.append((b, t))
-        self._sb += b
-        self._st += t
-        self._sbb += b * b
-        self._sbt += b * t
-        if len(self._obs) > self.window:
-            ob, ot = self._obs.popleft()
-            self._sb -= ob
-            self._st -= ot
-            self._sbb -= ob * ob
-            self._sbt -= ob * ot
-
-    def ingest(self, observations: List[BatchObservation]) -> None:
-        for o in observations:
-            if o.batch_id > self._last_id:
-                self._add(o.size, o.total_latency)
-                self._last_id = o.batch_id
-
-    @property
-    def n(self) -> int:
-        return len(self._obs)
-
-    def predict(self) -> Optional[Tuple[float, float]]:
-        """Return (A, C) for T_total ~= A*b + C, or None if no data yet."""
-        n = len(self._obs)
-        if n == 0:
-            return None
-        if n == 1:
-            return (0.0, self._st)
-        denom = n * self._sbb - self._sb * self._sb
-        if denom <= 1e-9:
-            return (0.0, self._st / n)
-        a = (n * self._sbt - self._sb * self._st) / denom
-        c = (self._st - a * self._sb) / n
-        if a < 0.0:
-            return (0.0, self._st / n)
-        return (a, c)
-
-
-def _max_b_for_budget(a: float, c: float, budget: float, safety: float,
-                      hard_cap: int) -> int:
-    """Largest b with safety*(a*b + c) <= budget."""
-    if budget <= 0:
-        return 1
-    if a <= 1e-9:
-        return hard_cap if safety * c <= budget else 1
-    b = (budget / safety - c) / a
-    if b < 1:
-        return 1
-    return min(hard_cap, int(b))
+from models import AdvancedState, Decision
+from .model import BaseAdvancedPolicy, TotalTimeModel, _max_b_for_budget
 
 
 class BlackBoxSLAOverlapPolicy(BaseAdvancedPolicy):
-    """
-    Flagship task-2 policy.
-
-    Learns T_total(b) from observed round trips, then:
-      - picks the largest batch that still fits the SLA budget (throughput),
-      - keeps up to max_in_flight batches in flight to mimic overlap,
-      - when the pipeline is empty, may collect for collect_ms before sealing.
-    """
+    """Learn T_total(b), pick the largest batch that fits SLA, keep max_in_flight in flight."""
 
     def __init__(self, safety: float = 1.2, max_in_flight: int = 2,
                  collect_ms: float = 0.0, window: int = 200,
@@ -136,10 +43,8 @@ class BlackBoxSLAOverlapPolicy(BaseAdvancedPolicy):
         ready = est is not None and self.model.n >= self.min_samples
         oldest = state.queue[0].arrival_time
 
-        # Size for throughput: the largest batch where a *fresh* request still
-        # fits the SLA. We deliberately do NOT shrink by the oldest request's
-        # remaining budget — under a backlog that would collapse to size 1 and
-        # kill throughput (death spiral). The oldest only affects collect timing.
+        # Size by a *fresh* request's SLA budget, not the oldest's remaining: under a
+        # backlog the latter collapses to 1 and kills throughput (death spiral).
         if est is None:
             b_cap = self.bootstrap_max
             b_target = min(len(state.queue), self.bootstrap_max)
@@ -151,18 +56,15 @@ class BlackBoxSLAOverlapPolicy(BaseAdvancedPolicy):
                 b_target = min(b_target, self.bootstrap_max)
         b_target = max(1, b_target)
 
-        # Pacing: never exceed max_in_flight. If saturated, hold — we will be
-        # re-consulted when a batch returns or a new request arrives.
         if state.in_flight >= self.max_in_flight:
             return Decision(close_batch_at=None, batch_size=None)
 
-        # Pipeline empty and queue not full yet: optionally collect a bit more,
-        # but never past the point where the oldest request would miss the SLA.
         if (state.in_flight == 0 and self.collect_ms > 0.0
                 and len(state.queue) < b_cap):
             collect_until = oldest + self.collect_ms
             if est is not None:
                 a, c = est
+                # don't wait past oldest's safe deadline: oldest + SLA - safety*(A*b + C)
                 must_close_by = oldest + state.sla_ms - self.safety * (a * b_target + c)
                 wait_until = min(collect_until, must_close_by)
             else:
@@ -174,13 +76,7 @@ class BlackBoxSLAOverlapPolicy(BaseAdvancedPolicy):
 
 
 class LatencyFeedbackPolicy(BaseAdvancedPolicy):
-    """
-    Pure reactive controller, no timing model at all.
-
-    Watches the observed round-trip latency of finished batches and nudges a
-    target batch size (AIMD style): grow when we are comfortably under SLA,
-    shrink hard when we get close to it.
-    """
+    """AIMD controller, no model: grow target batch when far under SLA, shrink hard when close."""
 
     def __init__(self, max_in_flight: int = 2, low: float = 0.55,
                  high: float = 0.85, inc: float = 2.0, dec: float = 0.7,
@@ -229,12 +125,8 @@ class LatencyFeedbackPolicy(BaseAdvancedPolicy):
 
 class ThroughputMatchPolicy(BaseAdvancedPolicy):
     """
-    Predictive black-box policy.
-
-    Estimates arrival rate (from when requests show up) and the batch departure
-    interval (from when batches come back), then sizes each batch so departures
-    keep up with arrivals: b ~= lambda * departure_interval * margin.
-    A learned T_total(b) caps the size so the SLA still holds.
+    Match departures to arrivals: b ≈ λ * departure_interval * margin, capped by SLA.
+    λ from EWMA of inter-arrivals, departure_interval from EWMA of gaps between returns.
     """
 
     def __init__(self, alpha: float = 0.2, margin: float = 1.15,
