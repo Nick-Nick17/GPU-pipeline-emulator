@@ -93,15 +93,21 @@ class HybridSLAOverlapPolicy(BasePolicy):
 
     def __init__(self, safety: float = 1.0, max_batch_size: Optional[int] = None,
                  collect_ms: float = 0.0, early_drain: bool = True,
-                 shed_hopeless: bool = False):
+                 shed_hopeless: bool = False, admit_infer: bool = False):
         self.safety = safety
         self.max_batch_size = max_batch_size
         self.collect_ms = collect_ms
         self.early_drain = early_drain
         self.shed_hopeless = shed_hopeless
+        self.admit_infer = admit_infer
 
     def name(self) -> str:
-        tag = "+shed" if self.shed_hopeless else ""
+        tags = []
+        if self.shed_hopeless:
+            tags.append("shed")
+        if self.admit_infer:
+            tags.append("admit")
+        tag = f"+{'+'.join(tags)}" if tags else ""
         return f"HybridSLAOverlap(s={self.safety},c={self.collect_ms:.0f}){tag}"
 
     def decide(self, state: SystemState) -> Decision:
@@ -131,12 +137,13 @@ class HybridSLAOverlapPolicy(BasePolicy):
             _finalize(state, cap, worst, early_drain=self.early_drain), worst, cap)
 
     def _decision(self, d: Decision, worst: float, cap: int) -> Decision:
-        if not self.shed_hopeless:
+        if not self.shed_hopeless and not self.admit_infer:
             return d
         return Decision(
             close_batch_at=d.close_batch_at,
             batch_size=d.batch_size,
-            shed_hopeless=True,
+            shed_hopeless=self.shed_hopeless or self.admit_infer,
+            admit_infer=self.admit_infer,
             shed_worst=worst,
             shed_b=cap,
         )

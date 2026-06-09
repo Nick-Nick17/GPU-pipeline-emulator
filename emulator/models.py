@@ -122,6 +122,7 @@ class Decision:
     close_batch_at: Optional[float] = None   # None = don't close yet, wait for next event
     batch_size: Optional[int] = None         # how many to take from queue front (None = all)
     shed_hopeless: bool = False              # drop hopeless prefix before batch close
+    admit_infer: bool = False                # infer-backlog admission + shed ready batches
     shed_worst: float = 1.0                 # worst-case factor for hopeless check
     shed_b: int = 1                          # batch size assumed for hopeless check
 
