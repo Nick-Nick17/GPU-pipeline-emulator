@@ -229,10 +229,6 @@ def run_scenario(name, rps, worst_case, duration_s, mode, opts=None):
           f"time={mult}  b_max={b_max}  mode={mode}{extra}")
     print(f"  reference: BASELINE(B={baseline_batch}, T={baseline_timeout_ms:.1f}ms)")
     print(f"{'=' * 86}")
-    print(f"  {'Policy':<38} {'slaRPS':>11} {'Success':>8} {'Rate':>7} {'Late':>6} "
-          f"{'Drop':>6} {'batch':>6} {'p50':>9} {'p90':>9} {'p99':>9} {'idle':>6}")
-    print(f"  {'-' * 38} {'-' * 11} {'-' * 8} {'-' * 7} {'-' * 6} "
-          f"{'-' * 6} {'-' * 6} {'-' * 9} {'-' * 9} {'-' * 9} {'-' * 6}")
 
     def sla_rps(m):
         return m.success_count / duration_s
@@ -285,6 +281,11 @@ def run_scenario(name, rps, worst_case, duration_s, mode, opts=None):
     baseline = [m for m in results if m.policy_name.startswith("BASELINE")]
     rest = sorted((m for m in results if not m.policy_name.startswith("BASELINE")),
                   key=lambda x: (-sla_rps(x), x.p99_ms))
+
+    print(f"  {'Policy':<38} {'slaRPS':>11} {'Success':>8} {'Rate':>7} {'Late':>6} "
+          f"{'Drop':>6} {'batch':>6} {'p50':>9} {'p90':>9} {'p99':>9} {'idle':>6}")
+    print(f"  {'-' * 38} {'-' * 11} {'-' * 8} {'-' * 7} {'-' * 6} "
+          f"{'-' * 6} {'-' * 6} {'-' * 9} {'-' * 9} {'-' * 9} {'-' * 6}")
     for m in baseline + rest:
         print_row(m)
 
