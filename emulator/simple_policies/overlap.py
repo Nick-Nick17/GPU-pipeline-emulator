@@ -1,3 +1,4 @@
+from itertools import islice
 from typing import Optional, List
 from models import SystemState, Decision
 from .base import BasePolicy
@@ -8,23 +9,72 @@ def _infer_free(state: SystemState, worst: float) -> float:
     return base + worst * state.committed_infer_nominal
 
 
-def _finalize(state: SystemState, b_cap: int, worst: float) -> Decision:
+def _worst_processing(p, b: int, worst: float) -> float:
+    return worst * (p.t_prepare_nominal(b) + p.t_infer_nominal(b))
+
+
+def _must_close_by_oldest(state: SystemState, b: int, worst: float) -> float:
+    """Legacy SLA deadline: pace by the oldest queued request (may already be hopeless)."""
+    p = state.params
+    proc = _worst_processing(p, b, worst)
+    return state.queue[0].arrival_time + state.sla_ms - proc
+
+
+def _must_close_by_salvageable(state: SystemState, b: int, worst: float) -> Optional[float]:
+    """
+    Latest close time so the first still-salvageable request in the batch window meets SLA.
+    Only the first b queue slots matter — a salvageable request behind position b would not
+    be included in this close anyway. Returns None when every slot in the window is hopeless.
+    """
+    p = state.params
+    proc = _worst_processing(p, b, worst)
+    threshold = state.now + proc - state.sla_ms
+    window = min(b, len(state.queue))
+    if window == 0:
+        return None
+
+    oldest = state.queue[0]
+    if oldest.arrival_time > threshold:
+        return oldest.arrival_time + state.sla_ms - proc
+
+    for req in islice(state.queue, 1, window):
+        if req.arrival_time > threshold:
+            return req.arrival_time + state.sla_ms - proc
+    return None
+
+
+def _finalize(state: SystemState, b_cap: int, worst: float,
+              drain_cap: Optional[int] = None,
+              early_drain: bool = True,
+              sla_mode: str = "salvageable") -> Decision:
     """
     Close timing shared by the overlap policies. Two deadlines:
       overlap:  ideal_close = infer_free - worst*T_prepare(b)   (prepare ends as infer frees)
-      SLA:      must_close_by = oldest + SLA - worst*(T_prepare(b) + T_infer(b))
+      SLA:      must_close_by from first salvageable request, or oldest (legacy) in the window
     Take the earlier one; if it already passed, close now.
+
+    drain_cap: queue depth that triggers immediate close (defaults to b_cap). Policies with
+    a dynamic target batch size pass the global max here so we don't micro-close on every tick.
+    early_drain=False skips that path so SLA pacing (salvageable vs oldest) can differ.
     """
     p = state.params
+    if early_drain:
+        drain = drain_cap if drain_cap is not None else b_cap
+        if len(state.queue) >= drain:
+            return Decision(close_batch_at=state.now,
+                            batch_size=min(len(state.queue), drain))
+
     b_used = max(1, min(len(state.queue), b_cap))
-    oldest = state.queue[0].arrival_time
-    deadline = oldest + state.sla_ms
     busy_until = _infer_free(state, worst)
 
     ideal_close = busy_until - worst * p.t_prepare_nominal(b_used)
-    must_close_by = deadline - worst * (
-        p.t_prepare_nominal(b_used) + p.t_infer_nominal(b_used)
-    )
+    if sla_mode == "oldest":
+        must_close_by = _must_close_by_oldest(state, b_used, worst)
+    else:
+        must_close_by = _must_close_by_salvageable(state, b_used, worst)
+        if must_close_by is None:
+            return Decision(close_batch_at=state.now, batch_size=b_used)
+
     close_at = min(ideal_close, must_close_by)
 
     if state.now >= close_at:
@@ -36,10 +86,11 @@ class HybridSLAOverlapPolicy(BasePolicy):
     """Max batch within SLA budget + overlap timing. Optional idle collection window."""
 
     def __init__(self, safety: float = 1.0, max_batch_size: Optional[int] = None,
-                 collect_ms: float = 0.0):
+                 collect_ms: float = 0.0, early_drain: bool = True):
         self.safety = safety
         self.max_batch_size = max_batch_size
         self.collect_ms = collect_ms
+        self.early_drain = early_drain
 
     def name(self) -> str:
         return f"HybridSLAOverlap(s={self.safety},c={self.collect_ms:.0f})"
@@ -58,13 +109,49 @@ class HybridSLAOverlapPolicy(BasePolicy):
             collect_until = oldest + self.collect_ms
             if state.now < collect_until:
                 b_used = max(1, min(len(state.queue), cap))
-                must_close_by = (oldest + state.sla_ms) - worst * (
-                    p.t_prepare_nominal(b_used) + p.t_infer_nominal(b_used)
-                )
+                must_close_by = _must_close_by_salvageable(state, b_used, worst)
+                if must_close_by is None:
+                    return Decision(close_batch_at=state.now,
+                                    batch_size=min(len(state.queue), cap))
                 return Decision(close_batch_at=min(collect_until, must_close_by),
                                 batch_size=None)
 
-        return _finalize(state, cap, worst)
+        return _finalize(state, cap, worst, early_drain=self.early_drain)
+
+
+class HybridSLAOverlapLegacyPolicy(BasePolicy):
+    """Hybrid with legacy SLA pacing: must_close_by from oldest request, not first salvageable."""
+
+    def __init__(self, safety: float = 1.0, max_batch_size: Optional[int] = None,
+                 collect_ms: float = 0.0, early_drain: bool = True):
+        self.safety = safety
+        self.max_batch_size = max_batch_size
+        self.collect_ms = collect_ms
+        self.early_drain = early_drain
+
+    def name(self) -> str:
+        return f"HybridSLAOverlap-oldest(s={self.safety},c={self.collect_ms:.0f})"
+
+    def decide(self, state: SystemState) -> Decision:
+        if not state.queue:
+            return Decision(close_batch_at=None, batch_size=None)
+
+        p = state.params
+        worst = self.safety * (1.0 + p.variance)
+        cap = self._cap(state, self.max_batch_size)
+
+        idle = not state.infer_busy and state.committed_count == 0
+        if idle and self.collect_ms > 0.0 and len(state.queue) < cap:
+            oldest = state.queue[0].arrival_time
+            collect_until = oldest + self.collect_ms
+            if state.now < collect_until:
+                b_used = max(1, min(len(state.queue), cap))
+                must_close_by = _must_close_by_oldest(state, b_used, worst)
+                return Decision(close_batch_at=min(collect_until, must_close_by),
+                                batch_size=None)
+
+        return _finalize(state, cap, worst, sla_mode="oldest",
+                         early_drain=self.early_drain)
 
 
 class PredictiveOverlapPolicy(BasePolicy):
@@ -160,7 +247,7 @@ class QueueFeedbackPolicy(BasePolicy):
         b_cap = max(self.b_min, b_cap)
         b_cap = max(1, min(cap, b_cap))
 
-        return _finalize(state, b_cap, worst)
+        return _finalize(state, b_cap, worst, drain_cap=cap)
 
 
 class OptimalOverlapPolicy(BasePolicy):
@@ -168,7 +255,7 @@ class OptimalOverlapPolicy(BasePolicy):
     Theoretical optimum for task 1: throughput(b)=b/T_infer(b) grows with b → always b_max.
     Close at min of two deadlines:
       overlap:  infer_free - safety*T_prepare(b)            (prepare ends as infer frees)
-      SLA:      oldest + SLA - worst*(T_prepare(b)+T_infer(b))
+      SLA:      first salvageable request (same rule as Hybrid)
     If the system is idle there is no infer to overlap with → use the SLA deadline only.
     """
 
@@ -186,14 +273,17 @@ class OptimalOverlapPolicy(BasePolicy):
         p = state.params
         worst = self.safety * (1.0 + p.variance)
         cap = self._cap(state, self.max_batch_size)
+        if len(state.queue) >= cap:
+            return Decision(close_batch_at=state.now, batch_size=cap)
+
         b = min(len(state.queue), cap)
 
         infer_free = self._infer_free_at(state)
         overlap_close = infer_free - self.safety * p.t_prepare_nominal(b)
 
-        oldest_arrival = state.queue[0].arrival_time
-        worst_processing = worst * (p.t_prepare_nominal(b) + p.t_infer_nominal(b))
-        sla_close = oldest_arrival + state.sla_ms - worst_processing
+        sla_close = _must_close_by_salvageable(state, b, worst)
+        if sla_close is None:
+            return Decision(close_batch_at=state.now, batch_size=b)
 
         close_at = min(overlap_close, sla_close)
 

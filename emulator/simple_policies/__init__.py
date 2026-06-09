@@ -10,6 +10,7 @@ from .baselines import (
 )
 from .overlap import (
     HybridSLAOverlapPolicy,
+    HybridSLAOverlapLegacyPolicy,
     PredictiveOverlapPolicy,
     QueueFeedbackPolicy,
     OptimalOverlapPolicy,
@@ -22,6 +23,7 @@ __all__ = [
     "DeadlineOverlapPolicy",
     "SLABudgetPolicy",
     "HybridSLAOverlapPolicy",
+    "HybridSLAOverlapLegacyPolicy",
     "PredictiveOverlapPolicy",
     "QueueFeedbackPolicy",
     "OptimalOverlapPolicy",
