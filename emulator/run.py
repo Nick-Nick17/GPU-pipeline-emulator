@@ -116,6 +116,8 @@ def build_simple_policies(b_max, baseline_batch, baseline_timeout_ms,
         BaselinePolicy(baseline_batch, baseline_timeout_ms, max_batch_size=b_max),
         HybridSLAOverlapPolicy(safety=1.0, collect_ms=0.0, max_batch_size=b_max,
                                **hybrid_kw),
+        HybridSLAOverlapPolicy(safety=1.0, collect_ms=0.0, max_batch_size=b_max,
+                               shed_hopeless=True, **hybrid_kw),
         HybridSLAOverlapPolicy(safety=1.0, collect_ms=2.0, max_batch_size=b_max,
                                **hybrid_kw),
         HybridSLAOverlapPolicy(safety=1.2, collect_ms=0.0, max_batch_size=b_max,
@@ -225,10 +227,10 @@ def run_scenario(name, rps, worst_case, duration_s, mode, opts=None):
           f"time={mult}  b_max={b_max}  mode={mode}{extra}")
     print(f"  reference: BASELINE(B={baseline_batch}, T={baseline_timeout_ms:.1f}ms)")
     print(f"{'=' * 86}")
-    print(f"  {'Policy':<38} {'slaRPS':>11} {'Success':>8} {'Rate':>7} {'Late':>6} {'batch':>6} "
-          f"{'p50':>9} {'p90':>9} {'p99':>9} {'idle':>6}")
-    print(f"  {'-' * 38} {'-' * 11} {'-' * 8} {'-' * 7} {'-' * 6} {'-' * 6} "
-          f"{'-' * 9} {'-' * 9} {'-' * 9} {'-' * 6}")
+    print(f"  {'Policy':<38} {'slaRPS':>11} {'Success':>8} {'Rate':>7} {'Late':>6} "
+          f"{'Drop':>6} {'batch':>6} {'p50':>9} {'p90':>9} {'p99':>9} {'idle':>6}")
+    print(f"  {'-' * 38} {'-' * 11} {'-' * 8} {'-' * 7} {'-' * 6} "
+          f"{'-' * 6} {'-' * 6} {'-' * 9} {'-' * 9} {'-' * 9} {'-' * 6}")
 
     def sla_rps(m):
         return m.success_count / duration_s
@@ -243,6 +245,7 @@ def run_scenario(name, rps, worst_case, duration_s, mode, opts=None):
             f"{m.success_count:>8} "
             f"{m.success_rate:>6.1%} "
             f"{m.late_unserved:>6} "
+            f"{m.dropped:>6} "
             f"{m.avg_batch_size:>6.1f} "
             f"{m.p50_ms:>9.3f} "
             f"{m.p90_ms:>9.3f} "
@@ -271,6 +274,7 @@ def run_scenario(name, rps, worst_case, duration_s, mode, opts=None):
             sla_ms=sla_ms,
             batch_sizes=sim.batch_sizes,
             sim_end_ms=sim_ms,
+            dropped_requests=sim.dropped_requests,
         )
         results.append(m)
         print(f" done (slaRPS={sla_rps(m):,.0f})", flush=True)

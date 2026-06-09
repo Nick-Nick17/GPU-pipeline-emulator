@@ -69,6 +69,7 @@ class Simulator:
         # Results
         self.all_requests: List[Request] = []
         self.completed_requests: List[Request] = []
+        self.dropped_requests: List[Request] = []
         self.batch_sizes: List[int] = []
 
         # Scheduled ticks (to avoid duplicate SCHEDULE_TICK events)
@@ -254,6 +255,9 @@ class Simulator:
 
         decision = self.policy.decide(state)
 
+        if decision.shed_hopeless:
+            self._shed_hopeless_prefix(decision.shed_worst, decision.shed_b)
+
         if decision.close_batch_at is None:
             return
 
@@ -261,3 +265,16 @@ class Simulator:
             self._on_batch_close(decision.batch_size or len(self._queue))
         else:
             self._schedule_tick_at(decision.close_batch_at)
+
+    def _shed_hopeless_prefix(self, worst: float, shed_b: int):
+        """Drop contiguous hopeless requests from the queue front (no prepare/infer)."""
+        p = self.params
+        while self._queue:
+            b = max(1, min(len(self._queue), shed_b))
+            proc = worst * (p.t_prepare_nominal(b) + p.t_infer_nominal(b))
+            req = self._queue[0]
+            if req.arrival_time + self.sla_ms > self._now + proc:
+                break
+            self._queue.popleft()
+            req.dropped_at = self._now
+            self.dropped_requests.append(req)

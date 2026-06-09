@@ -13,6 +13,12 @@ def _worst_processing(p, b: int, worst: float) -> float:
     return worst * (p.t_prepare_nominal(b) + p.t_infer_nominal(b))
 
 
+def is_hopeless(req, now: float, sla_ms: float, p, worst: float, b: int = 1) -> bool:
+    """True when even closing a batch of size b right now cannot meet SLA for req."""
+    proc = _worst_processing(p, b, worst)
+    return req.arrival_time + sla_ms <= now + proc
+
+
 def _must_close_by_oldest(state: SystemState, b: int, worst: float) -> float:
     """Legacy SLA deadline: pace by the oldest queued request (may already be hopeless)."""
     p = state.params
@@ -86,14 +92,17 @@ class HybridSLAOverlapPolicy(BasePolicy):
     """Max batch within SLA budget + overlap timing. Optional idle collection window."""
 
     def __init__(self, safety: float = 1.0, max_batch_size: Optional[int] = None,
-                 collect_ms: float = 0.0, early_drain: bool = True):
+                 collect_ms: float = 0.0, early_drain: bool = True,
+                 shed_hopeless: bool = False):
         self.safety = safety
         self.max_batch_size = max_batch_size
         self.collect_ms = collect_ms
         self.early_drain = early_drain
+        self.shed_hopeless = shed_hopeless
 
     def name(self) -> str:
-        return f"HybridSLAOverlap(s={self.safety},c={self.collect_ms:.0f})"
+        tag = "+shed" if self.shed_hopeless else ""
+        return f"HybridSLAOverlap(s={self.safety},c={self.collect_ms:.0f}){tag}"
 
     def decide(self, state: SystemState) -> Decision:
         if not state.queue:
@@ -111,12 +120,26 @@ class HybridSLAOverlapPolicy(BasePolicy):
                 b_used = max(1, min(len(state.queue), cap))
                 must_close_by = _must_close_by_salvageable(state, b_used, worst)
                 if must_close_by is None:
-                    return Decision(close_batch_at=state.now,
-                                    batch_size=min(len(state.queue), cap))
-                return Decision(close_batch_at=min(collect_until, must_close_by),
-                                batch_size=None)
+                    return self._decision(
+                        Decision(close_batch_at=state.now,
+                                 batch_size=min(len(state.queue), cap)), worst, cap)
+                return self._decision(
+                    Decision(close_batch_at=min(collect_until, must_close_by),
+                             batch_size=None), worst, cap)
 
-        return _finalize(state, cap, worst, early_drain=self.early_drain)
+        return self._decision(
+            _finalize(state, cap, worst, early_drain=self.early_drain), worst, cap)
+
+    def _decision(self, d: Decision, worst: float, cap: int) -> Decision:
+        if not self.shed_hopeless:
+            return d
+        return Decision(
+            close_batch_at=d.close_batch_at,
+            batch_size=d.batch_size,
+            shed_hopeless=True,
+            shed_worst=worst,
+            shed_b=cap,
+        )
 
 
 class HybridSLAOverlapLegacyPolicy(BasePolicy):

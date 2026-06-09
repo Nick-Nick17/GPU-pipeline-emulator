@@ -48,6 +48,7 @@ class Request:
     prepare_end_time: Optional[float] = None
     infer_start_time: Optional[float] = None
     infer_end_time: Optional[float] = None     # when response is returned
+    dropped_at: Optional[float] = None         # shed load: rejected without processing
 
     @property
     def latency(self) -> Optional[float]:
@@ -118,8 +119,11 @@ class Decision:
     What the Policy tells the Scheduler to do right now.
     All times are absolute simulation time (ms).
     """
-    close_batch_at: Optional[float]   # None = don't close yet, wait for next event
-    batch_size: Optional[int]         # how many to take from queue front (None = all)
+    close_batch_at: Optional[float] = None   # None = don't close yet, wait for next event
+    batch_size: Optional[int] = None         # how many to take from queue front (None = all)
+    shed_hopeless: bool = False              # drop hopeless prefix before batch close
+    shed_worst: float = 1.0                 # worst-case factor for hopeless check
+    shed_b: int = 1                          # batch size assumed for hopeless check
 
 
 @dataclass

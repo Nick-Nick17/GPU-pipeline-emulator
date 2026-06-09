@@ -15,6 +15,7 @@ class SimMetrics:
     completed: int
     excluded: int
     late_unserved: int
+    dropped: int
     success_count: int
     success_rate: float
     p50_ms: float
@@ -34,7 +35,7 @@ class SimMetrics:
             f"  Requests  generated={self.generated}  counted={self.counted}  "
             f"completed={self.completed}  excluded(tail)={self.excluded}\n"
             f"  Success   {self.success_count} ({self.success_rate:.1%} of counted)  "
-            f"late_unserved={self.late_unserved}\n"
+            f"late_unserved={self.late_unserved}  dropped={self.dropped}\n"
             f"  Latency   p50={self.p50_ms:.0f}  p90={self.p90_ms:.0f}  "
             f"p99={self.p99_ms:.0f}  mean={self.mean_ms:.0f}  ms\n"
             f"  Avg batch size : {self.avg_batch_size:.1f}\n"
@@ -58,6 +59,7 @@ def compute_metrics(
     sla_ms: float,
     batch_sizes: List[int],
     sim_end_ms: float,
+    dropped_requests: Optional[List[Request]] = None,
 ) -> SimMetrics:
     latencies = []
     idles = []
@@ -66,7 +68,12 @@ def compute_metrics(
     late_unserved = 0
     excluded = 0
 
+    dropped = len(dropped_requests) if dropped_requests else sum(
+        1 for r in all_requests if r.dropped_at is not None)
+
     for r in all_requests:
+        if r.dropped_at is not None:
+            continue
         if r.latency is not None:
             completed += 1
             latencies.append(r.latency)
@@ -79,7 +86,7 @@ def compute_metrics(
         else:
             excluded += 1
 
-    counted = completed + late_unserved
+    counted = completed + late_unserved + dropped
 
     return SimMetrics(
         policy_name=policy_name,
@@ -88,6 +95,7 @@ def compute_metrics(
         completed=completed,
         excluded=excluded,
         late_unserved=late_unserved,
+        dropped=dropped,
         success_count=success,
         success_rate=success / counted if counted else 0.0,
         p50_ms=percentile(latencies, 50),
