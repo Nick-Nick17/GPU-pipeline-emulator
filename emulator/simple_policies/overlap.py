@@ -1,105 +1,75 @@
-from itertools import islice
-from typing import Optional, List
+from typing import Optional
+
 from models import SystemState, Decision
 from .base import BasePolicy
+from .overlap_core import (
+    finalize,
+    infer_free,
+    must_close_by_oldest,
+    must_close_by_salvageable,
+)
 
 
-def _infer_free(state: SystemState, worst: float) -> float:
-    base = state.infer_end_time if state.infer_busy else state.now
-    return base + worst * state.committed_infer_nominal
+def _worst(safety: float, state: SystemState) -> float:
+    return safety * (1.0 + state.params.variance)
 
 
-def _worst_processing(p, b: int, worst: float) -> float:
-    return worst * (p.t_prepare_nominal(b) + p.t_infer_nominal(b))
+def _with_load_control(d: Decision, worst: float, cap: int,
+                       shed_hopeless: bool, admit_infer: bool,
+                       max_committed: Optional[int]) -> Decision:
+    if not shed_hopeless and not admit_infer and max_committed is None:
+        return d
+    return Decision(
+        close_batch_at=d.close_batch_at,
+        batch_size=d.batch_size,
+        shed_hopeless=shed_hopeless or admit_infer,
+        admit_infer=admit_infer,
+        max_committed=max_committed,
+        shed_worst=worst,
+        shed_b=cap,
+    )
 
 
-def is_hopeless(req, now: float, sla_ms: float, p, worst: float, b: int = 1) -> bool:
-    """True when even closing a batch of size b right now cannot meet SLA for req."""
-    proc = _worst_processing(p, b, worst)
-    return req.arrival_time + sla_ms <= now + proc
-
-
-def _must_close_by_oldest(state: SystemState, b: int, worst: float) -> float:
-    """Legacy SLA deadline: pace by the oldest queued request (may already be hopeless)."""
-    p = state.params
-    proc = _worst_processing(p, b, worst)
-    return state.queue[0].arrival_time + state.sla_ms - proc
-
-
-def _must_close_by_salvageable(state: SystemState, b: int, worst: float) -> Optional[float]:
-    """
-    Latest close time so the first still-salvageable request in the batch window meets SLA.
-    Only the first b queue slots matter — a salvageable request behind position b would not
-    be included in this close anyway. Returns None when every slot in the window is hopeless.
-    """
-    p = state.params
-    proc = _worst_processing(p, b, worst)
-    threshold = state.now + proc - state.sla_ms
-    window = min(b, len(state.queue))
-    if window == 0:
+def _collect_while_idle(state: SystemState, cap: int, worst: float,
+                        collect_ms: float, sla_mode: str) -> Optional[Decision]:
+    idle = not state.infer_busy and state.committed_count == 0
+    if not (idle and collect_ms > 0.0 and len(state.queue) < cap):
         return None
 
-    oldest = state.queue[0]
-    if oldest.arrival_time > threshold:
-        return oldest.arrival_time + state.sla_ms - proc
+    oldest = state.queue[0].arrival_time
+    collect_until = oldest + collect_ms
+    if state.now >= collect_until:
+        return None
 
-    for req in islice(state.queue, 1, window):
-        if req.arrival_time > threshold:
-            return req.arrival_time + state.sla_ms - proc
-    return None
-
-
-def _finalize(state: SystemState, b_cap: int, worst: float,
-              drain_cap: Optional[int] = None,
-              early_drain: bool = True,
-              sla_mode: str = "salvageable") -> Decision:
-    """
-    Close timing shared by the overlap policies. Two deadlines:
-      overlap:  ideal_close = infer_free - worst*T_prepare(b)   (prepare ends as infer frees)
-      SLA:      must_close_by from first salvageable request, or oldest (legacy) in the window
-    Take the earlier one; if it already passed, close now.
-
-    drain_cap: queue depth that triggers immediate close (defaults to b_cap). Policies with
-    a dynamic target batch size pass the global max here so we don't micro-close on every tick.
-    early_drain=False skips that path so SLA pacing (salvageable vs oldest) can differ.
-    """
-    p = state.params
-    if early_drain:
-        drain = drain_cap if drain_cap is not None else b_cap
-        if len(state.queue) >= drain:
-            return Decision(close_batch_at=state.now,
-                            batch_size=min(len(state.queue), drain))
-
-    b_used = max(1, min(len(state.queue), b_cap))
-    busy_until = _infer_free(state, worst)
-
-    ideal_close = busy_until - worst * p.t_prepare_nominal(b_used)
+    b_used = max(1, min(len(state.queue), cap))
     if sla_mode == "oldest":
-        must_close_by = _must_close_by_oldest(state, b_used, worst)
-    else:
-        must_close_by = _must_close_by_salvageable(state, b_used, worst)
-        if must_close_by is None:
-            return Decision(close_batch_at=state.now, batch_size=b_used)
+        must_close_by = must_close_by_oldest(state, b_used, worst)
+        return Decision(close_batch_at=min(collect_until, must_close_by), batch_size=None)
 
-    close_at = min(ideal_close, must_close_by)
-
-    if state.now >= close_at:
-        return Decision(close_batch_at=state.now, batch_size=b_used)
-    return Decision(close_batch_at=close_at, batch_size=None)
+    must_close_by = must_close_by_salvageable(state, b_used, worst)
+    if must_close_by is None:
+        return Decision(close_batch_at=state.now,
+                        batch_size=min(len(state.queue), cap))
+    return Decision(close_batch_at=min(collect_until, must_close_by), batch_size=None)
 
 
 class HybridSLAOverlapPolicy(BasePolicy):
-    """Max batch within SLA budget + overlap timing. Optional idle collection window."""
-
     def __init__(self, safety: float = 1.0, max_batch_size: Optional[int] = None,
                  collect_ms: float = 0.0, early_drain: bool = True,
-                 shed_hopeless: bool = False, admit_infer: bool = False):
+                 shed_hopeless: bool = False, admit_infer: bool = False,
+                 max_committed_batches: Optional[int] = None):
         self.safety = safety
         self.max_batch_size = max_batch_size
         self.collect_ms = collect_ms
         self.early_drain = early_drain
         self.shed_hopeless = shed_hopeless
         self.admit_infer = admit_infer
+        if max_committed_batches is not None:
+            self.max_committed_batches = max_committed_batches
+        elif admit_infer:
+            self.max_committed_batches = 1
+        else:
+            self.max_committed_batches = None
 
     def name(self) -> str:
         tags = []
@@ -107,6 +77,8 @@ class HybridSLAOverlapPolicy(BasePolicy):
             tags.append("shed")
         if self.admit_infer:
             tags.append("admit")
+        if self.max_committed_batches is not None:
+            tags.append(f"mc{self.max_committed_batches}")
         tag = f"+{'+'.join(tags)}" if tags else ""
         return f"HybridSLAOverlap(s={self.safety},c={self.collect_ms:.0f}){tag}"
 
@@ -114,44 +86,19 @@ class HybridSLAOverlapPolicy(BasePolicy):
         if not state.queue:
             return Decision(close_batch_at=None, batch_size=None)
 
-        p = state.params
-        worst = self.safety * (1.0 + p.variance)
+        worst = _worst(self.safety, state)
         cap = self._cap(state, self.max_batch_size)
 
-        idle = not state.infer_busy and state.committed_count == 0
-        if idle and self.collect_ms > 0.0 and len(state.queue) < cap:
-            oldest = state.queue[0].arrival_time
-            collect_until = oldest + self.collect_ms
-            if state.now < collect_until:
-                b_used = max(1, min(len(state.queue), cap))
-                must_close_by = _must_close_by_salvageable(state, b_used, worst)
-                if must_close_by is None:
-                    return self._decision(
-                        Decision(close_batch_at=state.now,
-                                 batch_size=min(len(state.queue), cap)), worst, cap)
-                return self._decision(
-                    Decision(close_batch_at=min(collect_until, must_close_by),
-                             batch_size=None), worst, cap)
-
-        return self._decision(
-            _finalize(state, cap, worst, early_drain=self.early_drain), worst, cap)
-
-    def _decision(self, d: Decision, worst: float, cap: int) -> Decision:
-        if not self.shed_hopeless and not self.admit_infer:
-            return d
-        return Decision(
-            close_batch_at=d.close_batch_at,
-            batch_size=d.batch_size,
-            shed_hopeless=self.shed_hopeless or self.admit_infer,
-            admit_infer=self.admit_infer,
-            shed_worst=worst,
-            shed_b=cap,
+        d = _collect_while_idle(state, cap, worst, self.collect_ms, "salvageable")
+        if d is None:
+            d = finalize(state, cap, worst, early_drain=self.early_drain)
+        return _with_load_control(
+            d, worst, cap, self.shed_hopeless, self.admit_infer,
+            self.max_committed_batches,
         )
 
 
 class HybridSLAOverlapLegacyPolicy(BasePolicy):
-    """Hybrid with legacy SLA pacing: must_close_by from oldest request, not first salvageable."""
-
     def __init__(self, safety: float = 1.0, max_batch_size: Optional[int] = None,
                  collect_ms: float = 0.0, early_drain: bool = True):
         self.safety = safety
@@ -166,27 +113,17 @@ class HybridSLAOverlapLegacyPolicy(BasePolicy):
         if not state.queue:
             return Decision(close_batch_at=None, batch_size=None)
 
-        p = state.params
-        worst = self.safety * (1.0 + p.variance)
+        worst = _worst(self.safety, state)
         cap = self._cap(state, self.max_batch_size)
 
-        idle = not state.infer_busy and state.committed_count == 0
-        if idle and self.collect_ms > 0.0 and len(state.queue) < cap:
-            oldest = state.queue[0].arrival_time
-            collect_until = oldest + self.collect_ms
-            if state.now < collect_until:
-                b_used = max(1, min(len(state.queue), cap))
-                must_close_by = _must_close_by_oldest(state, b_used, worst)
-                return Decision(close_batch_at=min(collect_until, must_close_by),
-                                batch_size=None)
-
-        return _finalize(state, cap, worst, sla_mode="oldest",
+        d = _collect_while_idle(state, cap, worst, self.collect_ms, "oldest")
+        if d is None:
+            d = finalize(state, cap, worst, sla_mode="oldest",
                          early_drain=self.early_drain)
+        return d
 
 
 class PredictiveOverlapPolicy(BasePolicy):
-    """Estimate arrival rate λ (EWMA of inter-arrivals), size batch to keep capacity ≥ λ."""
-
     def __init__(self, alpha: float = 0.3, margin: float = 1.3,
                  safety: float = 1.0, max_batch_size: Optional[int] = None):
         self.alpha = alpha
@@ -200,7 +137,7 @@ class PredictiveOverlapPolicy(BasePolicy):
     def name(self) -> str:
         return f"PredictiveOverlap(a={self.alpha},m={self.margin},s={self.safety})"
 
-    def _update_rate(self, queue: List) -> float:
+    def _update_rate(self, queue) -> float:
         new_reqs = []
         for req in reversed(queue):
             if req.request_id <= self._last_id:
@@ -225,8 +162,6 @@ class PredictiveOverlapPolicy(BasePolicy):
         return 0.0
 
     def _throughput_floor(self, params, lam: float) -> int:
-        # need = λ*margin req/ms; with T_infer = a2*b + c2, capacity b/T_infer ≥ need
-        # → b ≥ need*c2 / (1 - need*a2)
         need = lam * self.margin
         if need <= 0:
             return 1
@@ -240,21 +175,13 @@ class PredictiveOverlapPolicy(BasePolicy):
         if not state.queue:
             return Decision(close_batch_at=None, batch_size=None)
 
-        p = state.params
-        worst = self.safety * (1.0 + p.variance)
+        worst = _worst(self.safety, state)
         cap = self._cap(state, self.max_batch_size)
-
-        if lam <= 0.0:
-            b_cap = cap
-        else:
-            b_cap = max(1, min(cap, self._throughput_floor(p, lam)))
-
-        return _finalize(state, b_cap, worst)
+        b_cap = cap if lam <= 0.0 else max(1, min(cap, self._throughput_floor(state.params, lam)))
+        return finalize(state, b_cap, worst)
 
 
 class QueueFeedbackPolicy(BasePolicy):
-    """Proportional controller: b = clamp(k*len(queue), b_min, cap)."""
-
     def __init__(self, k: float = 1.0, b_min: int = 1,
                  safety: float = 1.0, max_batch_size: Optional[int] = None):
         self.k = k
@@ -269,26 +196,14 @@ class QueueFeedbackPolicy(BasePolicy):
         if not state.queue:
             return Decision(close_batch_at=None, batch_size=None)
 
-        p = state.params
-        worst = self.safety * (1.0 + p.variance)
+        worst = _worst(self.safety, state)
         cap = self._cap(state, self.max_batch_size)
-
-        b_cap = int(round(self.k * len(state.queue)))
-        b_cap = max(self.b_min, b_cap)
+        b_cap = max(self.b_min, int(round(self.k * len(state.queue))))
         b_cap = max(1, min(cap, b_cap))
-
-        return _finalize(state, b_cap, worst, drain_cap=cap)
+        return finalize(state, b_cap, worst, drain_cap=cap)
 
 
 class OptimalOverlapPolicy(BasePolicy):
-    """
-    Theoretical optimum for task 1: throughput(b)=b/T_infer(b) grows with b → always b_max.
-    Close at min of two deadlines:
-      overlap:  infer_free - safety*T_prepare(b)            (prepare ends as infer frees)
-      SLA:      first salvageable request (same rule as Hybrid)
-    If the system is idle there is no infer to overlap with → use the SLA deadline only.
-    """
-
     def __init__(self, safety: float = 1.0, max_batch_size: Optional[int] = None):
         self.safety = safety
         self.max_batch_size = max_batch_size
@@ -301,25 +216,19 @@ class OptimalOverlapPolicy(BasePolicy):
             return Decision(close_batch_at=None, batch_size=None)
 
         p = state.params
-        worst = self.safety * (1.0 + p.variance)
+        worst = _worst(self.safety, state)
         cap = self._cap(state, self.max_batch_size)
         if len(state.queue) >= cap:
             return Decision(close_batch_at=state.now, batch_size=cap)
 
         b = min(len(state.queue), cap)
-
-        infer_free = self._infer_free_at(state)
-        overlap_close = infer_free - self.safety * p.t_prepare_nominal(b)
-
-        sla_close = _must_close_by_salvageable(state, b, worst)
+        overlap_close = infer_free(state, worst) - self.safety * p.t_prepare_nominal(b)
+        sla_close = must_close_by_salvageable(state, b, worst)
         if sla_close is None:
             return Decision(close_batch_at=state.now, batch_size=b)
 
-        close_at = min(overlap_close, sla_close)
-
-        system_idle = not state.infer_busy and state.committed_count == 0
-        if system_idle:
-            close_at = sla_close
+        close_at = sla_close if (not state.infer_busy and state.committed_count == 0) \
+            else min(overlap_close, sla_close)
 
         if close_at <= state.now:
             return Decision(close_batch_at=state.now, batch_size=b)

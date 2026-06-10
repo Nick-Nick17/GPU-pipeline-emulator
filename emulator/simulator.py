@@ -20,6 +20,7 @@ from models import (
     SystemState, AdvancedState, BatchObservation, Decision
 )
 from environment import PipelineEnvironment
+from load_control import apply as apply_load_control, admit_batch_close
 from simple_policies import BasePolicy
 
 
@@ -254,13 +255,7 @@ class Simulator:
             )
 
         decision = self.policy.decide(state)
-
-        if decision.admit_infer:
-            self._shed_hopeless_prefix(
-                decision.shed_worst, decision.shed_b, use_infer_backlog=True)
-            self._shed_ready_batches(decision.shed_worst)
-        elif decision.shed_hopeless:
-            self._shed_hopeless_prefix(decision.shed_worst, decision.shed_b)
+        apply_load_control(decision, self)
 
         if decision.close_batch_at is None:
             return
@@ -269,67 +264,11 @@ class Simulator:
             if not self._queue:
                 return
             size = min(decision.batch_size or len(self._queue), len(self._queue))
-            if decision.admit_infer and not self._admit_batch_close(size, decision.shed_worst):
+            if decision.admit_infer and not admit_batch_close(self, size, decision.shed_worst):
+                return
+            if (decision.max_committed is not None
+                    and self._committed_count >= decision.max_committed):
                 return
             self._on_batch_close(size)
         else:
             self._schedule_tick_at(decision.close_batch_at)
-
-    def _infer_free(self, worst: float) -> float:
-        base = self._infer_end_time if self._infer_busy else self._now
-        return base + worst * self._committed_infer_nominal
-
-    def _est_infer_complete(self, worst: float, batch_size: int) -> float:
-        p = self.params
-        return self._infer_free(worst) + worst * p.t_infer_nominal(batch_size)
-
-    def _drop_request(self, req: Request):
-        req.dropped_at = self._now
-        self.dropped_requests.append(req)
-
-    def _admit_batch_close(self, size: int, worst: float) -> bool:
-        """True when the front batch window still has at least one salvageable request."""
-        if not self._queue:
-            return False
-        b = max(1, min(size, len(self._queue)))
-        if self._queue[0].arrival_time + self.sla_ms > self._est_infer_complete(worst, b):
-            return True
-        self._shed_hopeless_prefix(worst, b, use_infer_backlog=True)
-        if not self._queue:
-            return False
-        b = max(1, min(size, len(self._queue)))
-        return self._queue[0].arrival_time + self.sla_ms > self._est_infer_complete(worst, b)
-
-    def _shed_hopeless_prefix(self, worst: float, shed_b: int,
-                              use_infer_backlog: bool = False):
-        """Drop contiguous hopeless requests from the queue front (no prepare/infer)."""
-        p = self.params
-        while self._queue:
-            b = max(1, min(len(self._queue), shed_b))
-            req = self._queue[0]
-            if use_infer_backlog:
-                deadline = self._est_infer_complete(worst, b)
-            else:
-                proc = worst * (p.t_prepare_nominal(b) + p.t_infer_nominal(b))
-                deadline = self._now + proc
-            if req.arrival_time + self.sla_ms > deadline:
-                break
-            self._queue.popleft()
-            self._drop_request(req)
-
-    def _shed_ready_batches(self, worst: float):
-        """Drop prepared batches that cannot meet SLA given the infer backlog."""
-        p = self.params
-        slot = self._infer_end_time if self._infer_busy else self._now
-        while self._ready_batches:
-            batch = self._ready_batches[0]
-            infer_end = slot + worst * p.t_infer_nominal(batch.size)
-            if batch.requests[0].arrival_time + self.sla_ms > infer_end:
-                break
-            self._ready_batches.popleft()
-            self._committed_count -= 1
-            self._committed_infer_nominal -= p.t_infer_nominal(batch.size)
-            self._in_flight -= 1
-            for req in batch.requests:
-                self._drop_request(req)
-            slot = infer_end

@@ -44,6 +44,10 @@ class SimMetrics:
         )
 
 
+def sla_rps(m: SimMetrics, duration_s: float) -> float:
+    return m.success_count / duration_s
+
+
 def percentile(data: List[float], p: float) -> float:
     if not data:
         return 0.0

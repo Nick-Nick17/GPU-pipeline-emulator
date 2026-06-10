@@ -123,6 +123,7 @@ class Decision:
     batch_size: Optional[int] = None         # how many to take from queue front (None = all)
     shed_hopeless: bool = False              # drop hopeless prefix before batch close
     admit_infer: bool = False                # infer-backlog admission + shed ready batches
+    max_committed: Optional[int] = None      # cap on prepares in flight + ready for infer
     shed_worst: float = 1.0                 # worst-case factor for hopeless check
     shed_b: int = 1                          # batch size assumed for hopeless check
 
