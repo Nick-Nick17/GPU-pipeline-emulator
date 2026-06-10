@@ -1,7 +1,8 @@
 """Grid-search for the reference batch_size + timeout policy."""
 from config import (
     PARAMS, SEED, SLA_MS, MAX_BATCH_WEIGHT, SCENARIOS, SCENARIO_BASELINES,
-    BASELINE_SEARCH_BATCH, BASELINE_SEARCH_TIMEOUT_MS,
+    BASELINE_SEARCH_BATCH, BASELINE_SEARCH_TIMEOUT_MS, format_duration_s,
+    filter_scenarios,
 )
 from metrics import compute_metrics, sla_rps
 from simulator import Simulator
@@ -51,21 +52,22 @@ def search_baseline(name, rps, worst_case, duration_s, sla_ms, b_max, mode,
     return bb, bt, bm
 
 
-def run_baseline_search(mode="simple"):
+def run_baseline_search(mode="simple", scenario_names=None):
     print(f"\n\n{'=' * 86}")
     print("  BASELINE SEARCH — one reference per scenario (ranked by slaRPS)")
     print(f"  coarse grid: {BASELINE_SEARCH_BATCH} x {BASELINE_SEARCH_TIMEOUT_MS}")
     print(f"{'=' * 86}")
 
     found = {}
-    for scenario in SCENARIOS:
+    for scenario in filter_scenarios(scenario_names):
         name, rps, worst_case, duration_s, *rest = scenario
         opts = rest[0] if rest else {}
         sla_ms = opts.get("sla_ms", SLA_MS)
         b_max = opts.get("b_max", min(PARAMS.b_max_safe(sla_ms), MAX_BATCH_WEIGHT))
         rps_label = "burst(peak=2M)" if callable(rps) else str(rps)
 
-        print(f"\n  --- {name}  RPS={rps_label}  dur={duration_s}s  SLA={sla_ms:.0f}ms ---")
+        print(f"\n  --- {name}  RPS={rps_label}  dur={format_duration_s(duration_s)}s  "
+              f"SLA={sla_ms:.0f}ms ---")
         print(f"  {'batch':>6} {'timeout':>8} {'slaRPS':>12} {'Rate':>7} {'p99':>9}")
 
         batch_grid = [b for b in BASELINE_SEARCH_BATCH if b <= b_max]

@@ -5,8 +5,11 @@ from .base import BasePolicy
 from .overlap_core import (
     finalize,
     infer_free,
+    infer_pipeline_batch_size,
+    is_pipeline_overloaded,
     must_close_by_oldest,
     must_close_by_salvageable,
+    pipeline_max_committed,
 )
 
 
@@ -57,14 +60,20 @@ class HybridSLAOverlapPolicy(BasePolicy):
     def __init__(self, safety: float = 1.0, max_batch_size: Optional[int] = None,
                  collect_ms: float = 0.0, early_drain: bool = True,
                  shed_hopeless: bool = False, admit_infer: bool = False,
-                 max_committed_batches: Optional[int] = None):
+                 max_committed_batches: Optional[int] = None,
+                 max_committed_auto: bool = False,
+                 overlap_optimistic: bool = False):
         self.safety = safety
         self.max_batch_size = max_batch_size
         self.collect_ms = collect_ms
         self.early_drain = early_drain
         self.shed_hopeless = shed_hopeless
         self.admit_infer = admit_infer
-        if max_committed_batches is not None:
+        self.max_committed_auto = max_committed_auto
+        self.overlap_optimistic = overlap_optimistic
+        if max_committed_auto:
+            self.max_committed_batches = None
+        elif max_committed_batches is not None:
             self.max_committed_batches = max_committed_batches
         elif admit_infer:
             self.max_committed_batches = 1
@@ -77,7 +86,9 @@ class HybridSLAOverlapPolicy(BasePolicy):
             tags.append("shed")
         if self.admit_infer:
             tags.append("admit")
-        if self.max_committed_batches is not None:
+        if self.max_committed_auto:
+            tags.append("mco" if self.overlap_optimistic else "mcn")
+        elif self.max_committed_batches is not None:
             tags.append(f"mc{self.max_committed_batches}")
         tag = f"+{'+'.join(tags)}" if tags else ""
         return f"HybridSLAOverlap(s={self.safety},c={self.collect_ms:.0f}){tag}"
@@ -91,10 +102,20 @@ class HybridSLAOverlapPolicy(BasePolicy):
 
         d = _collect_while_idle(state, cap, worst, self.collect_ms, "salvageable")
         if d is None:
-            d = finalize(state, cap, worst, early_drain=self.early_drain)
+            d = finalize(state, cap, worst, early_drain=self.early_drain,
+                         overlap_optimistic=self.overlap_optimistic)
+
+        mc = self.max_committed_batches
+        if self.max_committed_auto:
+            b_prep = max(1, d.batch_size or min(len(state.queue), cap))
+            b_inf = infer_pipeline_batch_size(state, cap)
+            overloaded = is_pipeline_overloaded(state, cap)
+            mc = pipeline_max_committed(
+                state.params, b_prep, b_inf, overloaded, self.overlap_optimistic,
+            )
+
         return _with_load_control(
-            d, worst, cap, self.shed_hopeless, self.admit_infer,
-            self.max_committed_batches,
+            d, worst, cap, self.shed_hopeless, self.admit_infer, mc,
         )
 
 

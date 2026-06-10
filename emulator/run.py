@@ -4,7 +4,10 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import PARAMS, SEED, SLA_MS, MAX_BATCH_WEIGHT, SCENARIOS
+from config import (
+    PARAMS, SEED, SLA_MS, MAX_BATCH_WEIGHT, format_duration_s,
+    filter_scenarios, add_scenario_args, scenario_names_from_args,
+)
 from baseline_search import resolve_baseline, run_baseline_search
 from metrics import compute_metrics, sla_rps
 from simulator import Simulator
@@ -25,7 +28,8 @@ def run_scenario(name, rps, worst_case, duration_s, mode, opts=None):
     extra = "  hybrid_drain=off" if not hybrid_early_drain else ""
 
     print(f"\n\n{'=' * 86}")
-    print(f"  SCENARIO {name}   RPS={rps_label}  dur={duration_s}s  SLA={sla_ms:.0f}ms  "
+    print(f"  SCENARIO {name}   RPS={rps_label}  dur={format_duration_s(duration_s)}s  "
+          f"SLA={sla_ms:.0f}ms  "
           f"time={mult}  b_max={b_max}  mode={mode}{extra}")
     print(f"  reference: BASELINE(B={baseline_batch}, T={baseline_timeout_ms:.1f}ms)")
     print(f"{'=' * 86}")
@@ -85,15 +89,17 @@ def main():
                        help="task 2: black-box, only batch entry/exit timing is known")
     parser.add_argument("--baseline", action="store_true",
                         help="phase 0: grid-search the best batch_size+timeout reference")
+    add_scenario_args(parser)
     parser.set_defaults(mode="simple")
     args = parser.parse_args()
+    scenarios = filter_scenarios(scenario_names_from_args(args))
 
     pipeline = (f"Pipeline: prepare = {PARAMS.a1}*b + {PARAMS.c1}   "
                 f"infer = {PARAMS.a2}*b + {PARAMS.c2}   variance=±{PARAMS.variance:.0%}")
 
     if args.baseline:
         print(pipeline)
-        run_baseline_search(mode=args.mode)
+        run_baseline_search(mode=args.mode, scenario_names=scenario_names_from_args(args))
         print()
         return
 
@@ -101,7 +107,7 @@ def main():
              else "TASK 1 (known prepare/infer split)")
     print(f"Mode: {args.mode}  ->  {label}")
     print(pipeline)
-    for scenario in SCENARIOS:
+    for scenario in scenarios:
         name, rps, worst_case, duration_s, *rest = scenario
         opts = rest[0] if rest else {}
         run_scenario(name, rps, worst_case, duration_s, args.mode, opts=opts)

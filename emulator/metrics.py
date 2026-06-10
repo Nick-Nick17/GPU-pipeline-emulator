@@ -48,6 +48,14 @@ def sla_rps(m: SimMetrics, duration_s: float) -> float:
     return m.success_count / duration_s
 
 
+def avg_batch_weighted(batch_sizes: List[int]) -> float:
+    """Mean batch size for a random request (weights large batches correctly)."""
+    total = sum(batch_sizes)
+    if not total:
+        return 0.0
+    return sum(s * s for s in batch_sizes) / total
+
+
 def percentile(data: List[float], p: float) -> float:
     if not data:
         return 0.0
@@ -106,7 +114,7 @@ def compute_metrics(
         p90_ms=percentile(latencies, 90),
         p99_ms=percentile(latencies, 99),
         mean_ms=statistics.mean(latencies) if latencies else 0.0,
-        avg_batch_size=statistics.mean(batch_sizes) if batch_sizes else 0.0,
+        avg_batch_size=avg_batch_weighted(batch_sizes),
         avg_idle_ms=statistics.mean(idles) if idles else 0.0,
         sla_ms=sla_ms,
     )

@@ -8,6 +8,8 @@ if TYPE_CHECKING:
 
 
 def apply(decision: Decision, sim: "Simulator") -> None:
+    if decision.drop_expired:
+        drop_expired_queue(sim)
     if decision.admit_infer:
         shed_queue_prefix(sim, decision.shed_worst, decision.shed_b,
                           use_infer_backlog=True)
@@ -27,6 +29,12 @@ def admit_batch_close(sim: "Simulator", size: int, worst: float) -> bool:
         return False
     b = max(1, min(size, len(sim._queue)))
     return _salvageable_at_infer(sim, sim._queue[0], worst, b)
+
+
+def drop_expired_queue(sim: "Simulator") -> None:
+    """Drop waiting requests whose SLA deadline has already passed."""
+    while sim._queue and sim._now > sim._queue[0].arrival_time + sim.sla_ms:
+        _drop(sim, sim._queue.popleft())
 
 
 def shed_queue_prefix(sim: "Simulator", worst: float, shed_b: int,
