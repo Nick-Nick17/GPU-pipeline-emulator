@@ -21,7 +21,7 @@ from models import (
 )
 from environment import PipelineEnvironment
 from load_control import apply as apply_load_control, admit_batch_close
-from prepare_queue import prepare_queue_cost_ms, prepare_cost_admits
+from prepare_queue import pipeline_prepare_cost_ms, prepare_cost_admits
 from simple_policies import BasePolicy
 
 
@@ -255,8 +255,9 @@ class Simulator:
                 infer_end_time=self._infer_end_time,
                 committed_count=self._committed_count,
                 committed_infer_nominal=self._committed_infer_nominal,
-                prepare_queue_cost_ms=prepare_queue_cost_ms(
-                    self._preparing_batches, self.params, self._now,
+                prepare_queue_cost_ms=pipeline_prepare_cost_ms(
+                    self._preparing_batches, self._ready_batches,
+                    self.params, self._now,
                 ),
                 preparing_count=len(self._preparing_batches),
                 ready_count=len(self._ready_batches),
