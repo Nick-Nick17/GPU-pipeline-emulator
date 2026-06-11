@@ -108,6 +108,9 @@ class SystemState:
     infer_end_time: Optional[float]  # when current infer will finish (None if idle)
     committed_count: int           # batches closed but not yet started inferring
     committed_infer_nominal: float  # sum of nominal infer times of committed batches
+    prepare_queue_cost_ms: float   # remaining nominal prepare work (decays with time)
+    preparing_count: int           # batches currently in prepare
+    ready_count: int                 # prepare done, waiting for infer
     params: PipelineParams
     sla_ms: float
     batch_history: List[int]       # recent batch sizes (for adaptive policies)
@@ -124,7 +127,9 @@ class Decision:
     shed_hopeless: bool = False              # drop hopeless prefix before batch close
     drop_expired: bool = False               # drop queue prefix already past SLA deadline
     admit_infer: bool = False                # infer-backlog admission + shed ready batches
-    max_committed: Optional[int] = None      # cap on prepares in flight + ready for infer
+    max_committed: Optional[int] = None      # legacy batch-count cap (mc1 compare)
+    max_prepare_cost_ms: Optional[float] = None  # time-based prepare load budget
+    prepare_add_cost_ms: Optional[float] = None  # nominal/effective cost of planned close
     shed_worst: float = 1.0                 # worst-case factor for hopeless check
     shed_b: int = 1                          # batch size assumed for hopeless check
 

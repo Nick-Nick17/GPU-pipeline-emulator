@@ -9,7 +9,9 @@ from .overlap_core import (
     is_pipeline_overloaded,
     must_close_by_oldest,
     must_close_by_salvageable,
+    effective_prepare_ms,
     pipeline_max_committed,
+    pipeline_max_prepare_cost_ms,
 )
 
 
@@ -19,8 +21,11 @@ def _worst(safety: float, state: SystemState) -> float:
 
 def _with_load_control(d: Decision, worst: float, cap: int,
                        shed_hopeless: bool, admit_infer: bool,
-                       max_committed: Optional[int]) -> Decision:
-    if not shed_hopeless and not admit_infer and max_committed is None:
+                       max_committed: Optional[int],
+                       max_prepare_cost_ms: Optional[float] = None,
+                       prepare_add_cost_ms: Optional[float] = None) -> Decision:
+    if (not shed_hopeless and not admit_infer and max_committed is None
+            and max_prepare_cost_ms is None):
         return d
     return Decision(
         close_batch_at=d.close_batch_at,
@@ -28,6 +33,8 @@ def _with_load_control(d: Decision, worst: float, cap: int,
         shed_hopeless=shed_hopeless or admit_infer,
         admit_infer=admit_infer,
         max_committed=max_committed,
+        max_prepare_cost_ms=max_prepare_cost_ms,
+        prepare_add_cost_ms=prepare_add_cost_ms,
         shed_worst=worst,
         shed_b=cap,
     )
@@ -62,7 +69,8 @@ class HybridSLAOverlapPolicy(BasePolicy):
                  shed_hopeless: bool = False, admit_infer: bool = False,
                  max_committed_batches: Optional[int] = None,
                  max_committed_auto: bool = False,
-                 overlap_optimistic: bool = False):
+                 overlap_optimistic: bool = False,
+                 prepare_queue_admit: bool = False):
         self.safety = safety
         self.max_batch_size = max_batch_size
         self.collect_ms = collect_ms
@@ -71,6 +79,7 @@ class HybridSLAOverlapPolicy(BasePolicy):
         self.admit_infer = admit_infer
         self.max_committed_auto = max_committed_auto
         self.overlap_optimistic = overlap_optimistic
+        self.prepare_queue_admit = prepare_queue_admit
         if max_committed_auto:
             self.max_committed_batches = None
         elif max_committed_batches is not None:
@@ -87,9 +96,13 @@ class HybridSLAOverlapPolicy(BasePolicy):
         if self.admit_infer:
             tags.append("admit")
         if self.max_committed_auto:
-            tags.append("mco" if self.overlap_optimistic else "mcn")
+            if self.prepare_queue_admit:
+                tags.append("pqo" if self.overlap_optimistic else "pqn")
+            else:
+                tags.append("mco" if self.overlap_optimistic else "mcn")
         elif self.max_committed_batches is not None:
-            tags.append(f"mc{self.max_committed_batches}")
+            n = self.max_committed_batches
+            tags.append(f"pq{n}" if self.prepare_queue_admit else f"mc{n}")
         tag = f"+{'+'.join(tags)}" if tags else ""
         return f"HybridSLAOverlap(s={self.safety},c={self.collect_ms:.0f}){tag}"
 
@@ -105,17 +118,32 @@ class HybridSLAOverlapPolicy(BasePolicy):
             d = finalize(state, cap, worst, early_drain=self.early_drain,
                          overlap_optimistic=self.overlap_optimistic)
 
+        b_prep = max(1, d.batch_size or min(len(state.queue), cap))
+        overloaded = is_pipeline_overloaded(state, cap)
+        add_cost = effective_prepare_ms(
+            state.params, b_prep, overloaded, self.overlap_optimistic,
+        )
+
+        max_prepare_cost = None
         mc = self.max_committed_batches
         if self.max_committed_auto:
-            b_prep = max(1, d.batch_size or min(len(state.queue), cap))
             b_inf = infer_pipeline_batch_size(state, cap)
-            overloaded = is_pipeline_overloaded(state, cap)
-            mc = pipeline_max_committed(
-                state.params, b_prep, b_inf, overloaded, self.overlap_optimistic,
-            )
+            if self.prepare_queue_admit:
+                max_prepare_cost = pipeline_max_prepare_cost_ms(
+                    state.params, b_prep, b_inf, overloaded, self.overlap_optimistic,
+                )
+            else:
+                mc = pipeline_max_committed(
+                    state.params, b_prep, b_inf, overloaded, self.overlap_optimistic,
+                )
+        elif mc is not None and self.prepare_queue_admit:
+            max_prepare_cost = mc * add_cost
+            mc = None
 
         return _with_load_control(
             d, worst, cap, self.shed_hopeless, self.admit_infer, mc,
+            max_prepare_cost_ms=max_prepare_cost,
+            prepare_add_cost_ms=add_cost if max_prepare_cost is not None else None,
         )
 
 

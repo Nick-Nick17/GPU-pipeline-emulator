@@ -13,7 +13,8 @@ def is_pipeline_overloaded(state: SystemState, cap: int) -> bool:
     """Infer/commit path active and waiting queue is building."""
     if not state.queue:
         return False
-    busy = state.infer_busy or state.committed_count > 0
+    busy = (state.infer_busy or state.committed_count > 0
+            or state.prepare_queue_cost_ms > 0)
     return busy and len(state.queue) >= max(1, cap // 2)
 
 
@@ -43,6 +44,14 @@ def pipeline_slack(params: PipelineParams, b_infer: int, b_prepare: int,
     """Infer time on GPU batch minus (effective) prepare time for the next batch."""
     return (params.t_infer_nominal(b_infer)
             - effective_prepare_ms(params, b_prepare, overloaded, optimistic))
+
+
+def pipeline_max_prepare_cost_ms(params: PipelineParams, b_prepare: int, b_infer: int,
+                                 overloaded: bool, optimistic: bool) -> float:
+    """Prepare-cost budget from infer/prepare slack (time-based admission)."""
+    mc = pipeline_max_committed(params, b_prepare, b_infer, overloaded, optimistic)
+    t_prep = effective_prepare_ms(params, b_prepare, overloaded, optimistic)
+    return mc * t_prep
 
 
 def pipeline_max_committed(params: PipelineParams, b_prepare: int, b_infer: int,

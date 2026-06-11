@@ -21,6 +21,7 @@ from models import (
 )
 from environment import PipelineEnvironment
 from load_control import apply as apply_load_control, admit_batch_close
+from prepare_queue import prepare_queue_cost_ms, prepare_cost_admits
 from simple_policies import BasePolicy
 
 
@@ -60,6 +61,7 @@ class Simulator:
         self._infer_busy: bool = False
         self._infer_end_time: Optional[float] = None
         self._ready_batches: Deque[Batch] = deque()
+        self._preparing_batches: Deque[Batch] = deque()
         self._committed_count: int = 0
         self._committed_infer_nominal: float = 0.0
 
@@ -174,6 +176,7 @@ class Simulator:
 
         self._committed_count += 1
         self._committed_infer_nominal += self.params.t_infer_nominal(batch.size)
+        self._preparing_batches.append(batch)
         self._in_flight += 1
 
         actual_prepare = self.env.actual_prepare_time(batch.size)
@@ -185,6 +188,9 @@ class Simulator:
         self._push_event(Event(prepare_end, EventType.PREPARE_DONE, batch))
 
     def _on_prepare_done(self, batch: Batch):
+        self._preparing_batches = deque(
+            b for b in self._preparing_batches if b.batch_id != batch.batch_id
+        )
         self._ready_batches.append(batch)
         self._dispatch_infer()
         self._consult_policy()
@@ -249,6 +255,11 @@ class Simulator:
                 infer_end_time=self._infer_end_time,
                 committed_count=self._committed_count,
                 committed_infer_nominal=self._committed_infer_nominal,
+                prepare_queue_cost_ms=prepare_queue_cost_ms(
+                    self._preparing_batches, self.params, self._now,
+                ),
+                preparing_count=len(self._preparing_batches),
+                ready_count=len(self._ready_batches),
                 params=self.params,
                 sla_ms=self.sla_ms,
                 batch_history=list(self.batch_sizes[-20:]),
@@ -266,8 +277,15 @@ class Simulator:
             size = min(decision.batch_size or len(self._queue), len(self._queue))
             if decision.admit_infer and not admit_batch_close(self, size, decision.shed_worst):
                 return
-            if (decision.max_committed is not None
-                    and self._committed_count >= decision.max_committed):
+            if decision.max_prepare_cost_ms is not None:
+                add = decision.prepare_add_cost_ms
+                if add is None:
+                    add = self.params.t_prepare_nominal(size)
+                if not prepare_cost_admits(
+                        state.prepare_queue_cost_ms, add, decision.max_prepare_cost_ms):
+                    return
+            elif (decision.max_committed is not None
+                  and self._committed_count >= decision.max_committed):
                 return
             self._on_batch_close(size)
         else:
